@@ -1,0 +1,10 @@
+#!/bin/bash
+# Replaces /usr/local/bin/valheim-server, which supervisor starts. The upstream script is kept
+# unchanged as valheim-server.upstream and exec'd once the world guard has agreed.
+/usr/local/bin/flux-world-guard
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "[flux-guard] not starting the Valheim server (guard status $rc); the world in /config/worlds_local is untouched" >&2
+    exit "$rc"
+fi
+exec /usr/local/bin/valheim-server.upstream "$@"

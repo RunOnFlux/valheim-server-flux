@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+Flux world guard: runs before EVERY launch of the Valheim server (see flux-valheim-server).
+
+Why it exists. Every Flux plan runs two instances of one world on a replicated volume
+(Syncthing); only the primary plays. When the primary goes down the standby starts from its
+copy, and a copy that is NOT a clean, complete save makes Valheim 1.0 do something silent:
+it fails to parse the world folder and GENERATES A NEW WORLD UNDER THE SAME NAME. Its first
+save then deletes the real world's files. Two tickets had a conflict file next to a complete
+save; one had a generation whose marker was newer than its data.
+
+What it does, in order, to worlds_local/<WORLD_NAME>/ only:
+  1. moves every *.sync-conflict-* file out of worlds_local into /config/sync-conflicts/
+     (kept, never deleted);
+  2. finds the newest generation N that has a `_main.N.ok` marker and checks it is complete:
+     `.fwl2`, `.db2` and `.chunks` exist and are not empty. Chunks the `.chunks` index lists but
+     the folder lacks are only REPORTED, never acted on: the on-disk naming was checked against
+     a one-chunk world, and a guard must not stop or roll back a healthy server on a guess;
+  3. if the newest generation is incomplete, moves its files aside so the newest COMPLETE older
+     generation is the one the game loads;
+  4. if no generation is complete but the folder is not empty, REFUSES: exit status 3, so the
+     server is not started and cannot generate a fresh world over the remains.
+An empty or missing folder is a genuinely new server and is left alone, and so is a pre-1.0
+world (`<name>.db` + `<name>.fwl`, no `.ok` markers): that format is not ours to judge.
+
+Exit status: 0 go ahead, 3 refuse. Everything it does is printed with a [flux-guard] prefix.
+"""
+import os
+import re
+import shutil
+import struct
+import sys
+import time
+
+HEADER = 10
+ENTRY = 11
+CHUNK_RE = re.compile(r'^(-?\d+)_(-?\d+)__(-?\d+)_(-?\d+)\.chunk$')
+GEN_RE = re.compile(r'^_main\.(\d+)\.(ok|fwl2|db2|chunks)$')
+
+
+def log(msg):
+    print('[flux-guard] ' + msg, flush=True)
+
+
+def quarantine_dir(config):
+    return os.path.join(config, 'sync-conflicts')
+
+
+def move_aside(path, config):
+    qdir = quarantine_dir(config)
+    os.makedirs(qdir, exist_ok=True)
+    dest = os.path.join(qdir, os.path.basename(path))
+    if os.path.exists(dest):
+        dest += '.' + str(int(time.time()))
+    shutil.move(path, dest)
+    return dest
+
+
+def quarantine_conflicts(worlds_dir, config):
+    moved = 0
+    for root, _dirs, files in os.walk(worlds_dir):
+        for name in files:
+            if 'sync-conflict' in name:
+                src = os.path.join(root, name)
+                log('conflict file moved aside: ' + src)
+                move_aside(src, config)
+                moved += 1
+    return moved
+
+
+def generations(world_dir):
+    """{N: set of extensions present} from the `_main.N.<ext>` files."""
+    gens = {}
+    for name in os.listdir(world_dir):
+        m = GEN_RE.match(name)
+        if m:
+            gens.setdefault(int(m.group(1)), set()).add(m.group(2))
+    return gens
+
+
+def chunk_index(path):
+    """The (x, y, layer, version) tuples a `.chunks` index lists, or None if it is unreadable."""
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    if len(data) < HEADER or (len(data) - HEADER) % ENTRY:
+        return None
+    out = []
+    for off in range(HEADER, len(data), ENTRY):
+        x, y, layer = data[off], data[off + 1], data[off + 2]
+        version = struct.unpack_from('<i', data, off + 3)[0]
+        out.append((x, y, layer, version))
+    return out
+
+
+def present_chunks(world_dir):
+    have = set()
+    for name in os.listdir(world_dir):
+        m = CHUNK_RE.match(name)
+        if m:
+            x, y, layer, version = (int(g) for g in m.groups())
+            have.add((x & 0xFF, y & 0xFF, layer & 0xFF, version))
+    return have
+
+
+def complete(world_dir, n):
+    """(True, '') when generation n has every file of a save, else (False, why)."""
+    for ext in ('ok', 'fwl2', 'db2', 'chunks'):
+        p = os.path.join(world_dir, '_main.%d.%s' % (n, ext))
+        if not os.path.isfile(p):
+            return False, 'missing _main.%d.%s' % (n, ext)
+        if ext != 'ok' and os.path.getsize(p) == 0:
+            return False, '_main.%d.%s is empty' % (n, ext)
+    return True, ''
+
+
+def chunks_present(world_dir, n):
+    try:
+        index = chunk_index(os.path.join(world_dir, '_main.%d.chunks' % n))
+    except OSError:
+        return False
+    if index is None:
+        return False
+    have = present_chunks(world_dir)
+    return all(c in have for c in index)
+
+
+def report_missing_chunks(world_dir, n):
+    """Log, never act: chunks the index lists that the folder does not have."""
+    try:
+        index = chunk_index(os.path.join(world_dir, '_main.%d.chunks' % n))
+    except OSError:
+        return
+    if index is None:
+        log('note: _main.%d.chunks is not in the layout this guard knows' % n)
+        return
+    have = present_chunks(world_dir)
+    missing = [c for c in index if c not in have]
+    if missing:
+        log('note: %d of %d chunks listed by _main.%d.chunks are not in the folder (not acted on)'
+            % (len(missing), len(index), n))
+
+
+def guard_world(world_dir, config):
+    """0 to go ahead, 3 to refuse."""
+    gens = generations(world_dir)
+    marked = sorted((n for n, exts in gens.items() if 'ok' in exts), reverse=True)
+    if not marked:
+        # No committed save. A lone `_main.0.fwl2` is what a brand new world looks like for its
+        # first minutes, and is safe. Data files with no marker are not: something was cut off.
+        if any(exts & {'db2', 'chunks'} for exts in gens.values()):
+            log('%s holds save data but no committed save marker; refusing to start so '
+                'a new world is not generated over it' % world_dir)
+            return 3
+        return 0
+    newest = marked[0]
+    ok, why = complete(world_dir, newest)
+    if ok:
+        report_missing_chunks(world_dir, newest)
+        return 0
+    log('newest save _main.%d is incomplete: %s' % (newest, why))
+    fallback = None
+    for n in marked[1:]:
+        # A fallback must also have its chunks: Valheim reaps an older generation's chunks once a
+        # newer save commits, so a bare set of markers could point at nothing.
+        if complete(world_dir, n)[0] and chunks_present(world_dir, n):
+            fallback = n
+            break
+    if fallback is None:
+        log('no complete save in %s; refusing to start so a new world is not generated over it' % world_dir)
+        return 3
+    for n in sorted(g for g in gens if g > fallback):
+        for ext in sorted(gens[n]):
+            src = os.path.join(world_dir, '_main.%d.%s' % (n, ext))
+            log('moved aside: ' + os.path.basename(src))
+            move_aside(src, config)
+    log('the server will load save _main.%d, the newest complete one' % fallback)
+    return 0
+
+
+def main():
+    config = os.environ.get('FLUX_CONFIG_DIR', '/config')
+    worlds = os.path.join(config, 'worlds_local')
+    if not os.path.isdir(worlds):
+        return 0
+    quarantine_conflicts(worlds, config)
+    world = os.environ.get('WORLD_NAME', 'Dedicated')
+    world_dir = os.path.join(worlds, world)
+    if not os.path.isdir(world_dir):
+        return 0
+    try:
+        return guard_world(world_dir, config)
+    except OSError as exc:
+        # An unreadable folder is not proof of anything: do not stop a server over our own error.
+        log('could not check %s (%s); starting anyway' % (world_dir, exc))
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

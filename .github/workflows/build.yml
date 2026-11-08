@@ -1,0 +1,75 @@
+name: Test, and rebuild on a new upstream release
+
+# Publishing :latest DOES reach running servers: FluxOS's image update service checks every
+# app's tag every six hours and soft-redeploys onto a new digest, which restarts the server. So a
+# scheduled run publishes only when there is something to apply (.github/ci/needs-rebuild.sh).
+# A push to main or a manual run always builds.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Upstream release to build on (e.g. 1.4.1). Blank = newest.'
+        required: false
+        default: ''
+
+env:
+  IMAGE_NAME: runonflux/valheim-server-flux
+  BASE_REPO: community-valheim-tools/valheim-server-docker
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in scripts/flux-valheim-server tests/*.sh .github/ci/*.sh; do bash -n "$f"; done
+      - name: Guard unit tests
+        run: python3 -m unittest tests.test_guard -v
+
+  check:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - id: check
+        env:
+          FORCE_VERSION: ${{ github.event.inputs.force_version }}
+        run: .github/ci/needs-rebuild.sh "${IMAGE_NAME}" "${BASE_REPO}"
+
+  build:
+    needs: [test, check]
+    if: github.event_name != 'pull_request' && needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            BASE_TAG=${{ needs.check.outputs.version }}
+            FLUX_IMAGE_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
