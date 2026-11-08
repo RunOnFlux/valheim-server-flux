@@ -39,7 +39,7 @@ GEN=$(newest_ok "$WORK/base"); [ -n "$GEN" ] && ok "fixture world saved as gener
 # Up means connected; a FRESH world is the one that prints "Generating locations" (a saved one loads its own).
 up() { wait_for 'Game server connected' 300 && sleep 25; }
 fresh() { has 'Generating locations'; }
-scenario() { rm -rf "$WORK/$1"; cp -a "$WORK/base" "$WORK/$1"; }
+scenario() { rm -rf "${WORK:?}/$1"; cp -a "$WORK/base" "$WORK/$1"; }
 
 # 1. healthy world: untouched, loads as the same world
 scenario healthy; run "$WORK/healthy"
@@ -52,7 +52,7 @@ fresh && bad "a fresh world was generated" || ok "the saved world loaded, not a 
 scenario conflict; touch "$WORK/conflict/worlds_local/Fixture/_main.$GEN.sync-conflict-20260930-165322-XUVBXFM.db2"
 run "$WORK/conflict"
 up && ok "world with a conflict file boots" || bad "conflict world did not boot"
-ls "$WORK/conflict/sync-conflicts" | grep -q sync-conflict && ok "conflict file quarantined" || bad "conflict file not quarantined"
+compgen -G "$WORK/conflict/sync-conflicts/*sync-conflict*" >/dev/null && ok "conflict file quarantined" || bad "conflict file not quarantined"
 docker stop -t 90 vhtest >/dev/null
 fresh && bad "a fresh world was generated" || ok "the saved world loaded, not a fresh one"
 
