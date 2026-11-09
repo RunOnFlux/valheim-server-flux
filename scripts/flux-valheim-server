@@ -1,6 +1,12 @@
 #!/bin/bash
 # Replaces /usr/local/bin/valheim-server, which supervisor starts. The upstream script is kept
 # unchanged as valheim-server.upstream and exec'd once the world guard has agreed.
+# Same start-up banner as the other Flux images (docker logs, the panel's log). ASCII only.
+rule='====================================================================='
+echo "${rule}"
+echo " Valheim server image by FluxCloud - https://runonflux.com"
+echo " Host this and 30+ other games in one click: https://runonflux.com/games"
+echo "${rule}"
 /usr/local/bin/flux-world-guard
 rc=$?
 if [ "$rc" -ne 0 ]; then

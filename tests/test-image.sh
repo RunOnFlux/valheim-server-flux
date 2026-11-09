@@ -67,7 +67,7 @@ fresh && bad "a fresh world was generated" || ok "the saved world loaded, not a 
 # 4. nothing complete: refuse, and leave the folder exactly as it was
 scenario broken; rm "$WORK/broken/worlds_local/Fixture/_main.$GEN.db2"
 before=$(cd "$WORK/broken/worlds_local" && find . -type f | sort | md5sum)
-run "$WORK/broken"; sleep 45
+run "$WORK/broken"; wait_for 'refusing to start' 300 || true
 has 'refusing to start' && ok "guard refused" || bad "guard did not refuse"
 has 'Game server connected' && bad "server started on a broken world" || ok "server did not start"
 after=$(cd "$WORK/broken/worlds_local" && find . -type f | sort | md5sum)
